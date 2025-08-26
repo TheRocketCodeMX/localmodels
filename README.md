@@ -1,4 +1,4 @@
-# GPT-OSS con Ollama + Docker + Ngrok
+# GPT-OSS con Ollama + Docker 
 
 Esta es la versión **optimizada** usando Ollama para ejecutar GPT-OSS localmente con APIs estructuradas y compatibles con OpenAI.
 
