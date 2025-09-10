@@ -9,13 +9,15 @@ services:
     environment:
       - OLLAMA_ORIGINS=*
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # GPU support commented out for WSL compatibility
+    # Uncomment the deploy section below if you have NVIDIA GPU properly configured
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
 
   # API Gateway with ngrok
   gpt-oss-gateway:
@@ -25,9 +27,8 @@ services:
     depends_on:
       - ollama
     environment:
-      - NGROK_AUTH_TOKEN=${NGROK_AUTH_TOKEN}
       - OLLAMA_BASE_URL=http://ollama:11434
-      - GPT_OSS_MODEL=${GPT_OSS_MODEL:-gpt-oss:20b}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-oss:20b}
     restart: unless-stopped
 
   # Optional: Web UI for testing
