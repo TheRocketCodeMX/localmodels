@@ -3,6 +3,7 @@ import asyncio
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 import uvicorn
@@ -13,6 +14,15 @@ from litellm import completion, acompletion
 from typing import Optional, List, Dict, Any
 
 app = FastAPI(title="Multi-Model API with LiteLLM", version="2.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configuration
 ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -47,8 +57,11 @@ AVAILABLE_MODELS = {
 }
 
 # Configure LiteLLM
-litellm.set_verbose = False
+litellm.set_verbose = True  # Enable debug
 litellm.drop_params = True
+# Turn on debug
+import litellm
+litellm._turn_on_debug()
 
 # Ollama client for direct access
 ollama_client = None
@@ -275,13 +288,47 @@ async def chat(request: ChatRequest):
             return StreamingResponse(generate(), media_type="text/plain")
         else:
             # Handle regular response with LiteLLM
-            response = await acompletion(
-                model=litellm_model,
-                messages=messages,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                api_base=ollama_base_url
-            )
+            try:
+                response = await acompletion(
+                    model=litellm_model,
+                    messages=messages,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    api_base=ollama_base_url,
+                    timeout=60
+                )
+            except Exception as litellm_error:
+                print(f"LiteLLM Error: {litellm_error}")
+                # Fallback: try direct Ollama call
+                try:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        ollama_request = {
+                            "model": selected_model,
+                            "prompt": request.message,
+                            "options": {
+                                "num_predict": request.max_tokens,
+                                "temperature": request.temperature
+                            },
+                            "stream": False
+                        }
+                        
+                        direct_response = await client.post(
+                            f"{ollama_base_url}/api/generate",
+                            json=ollama_request
+                        )
+                        
+                        if direct_response.status_code == 200:
+                            result = direct_response.json()
+                            return ChatResponse(
+                                response=result.get("response", ""),
+                                model=selected_model,
+                                usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                            )
+                        else:
+                            raise HTTPException(status_code=500, detail="Both LiteLLM and direct Ollama failed")
+                            
+                except Exception as fallback_error:
+                    raise HTTPException(status_code=500, detail=f"All methods failed: LiteLLM: {litellm_error}, Direct: {fallback_error}")
             
             content = response.choices[0].message.content
             usage_info = {
@@ -386,6 +433,46 @@ async def chat_gpt_oss(request: ChatRequest):
     """Chat with GPT-OSS 20B model"""
     request.model = "gpt-oss:20b"
     return await chat(request)
+
+# Direct Ollama endpoint for testing (without LiteLLM)
+@app.post("/chat/direct", response_model=ChatResponse)
+async def chat_direct_ollama(request: ChatRequest):
+    """Direct chat with Ollama (bypassing LiteLLM)"""
+    selected_model = request.model if request.model and request.model in AVAILABLE_MODELS else default_model
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            ollama_request = {
+                "model": selected_model,
+                "prompt": f"Reasoning: {request.reasoning}\nUser: {request.message}\nAssistant:",
+                "options": {
+                    "num_predict": request.max_tokens,
+                    "temperature": request.temperature
+                },
+                "stream": False
+            }
+            
+            response = await client.post(
+                f"{ollama_base_url}/api/generate",
+                json=ollama_request
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return ChatResponse(
+                    response=result.get("response", ""),
+                    model=selected_model,
+                    usage={
+                        "prompt_tokens": result.get("prompt_eval_count", 0),
+                        "completion_tokens": result.get("eval_count", 0),
+                        "total_tokens": result.get("prompt_eval_count", 0) + result.get("eval_count", 0)
+                    }
+                )
+            else:
+                raise HTTPException(status_code=500, detail=f"Ollama API error: {response.status_code}")
+                
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error with direct Ollama call: {str(e)}")
 
 @app.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(request: EmbeddingRequest):
