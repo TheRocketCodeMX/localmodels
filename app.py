@@ -396,44 +396,6 @@ async def litellm_chat_completions(request: OpenAIChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in LiteLLM endpoint: {str(e)}")
 
-# Specific model endpoints
-@app.post("/chat/{model_name}", response_model=ChatResponse)
-async def chat_with_specific_model(model_name: str, request: ChatRequest):
-    """Chat with a specific model by name"""
-    if model_name not in AVAILABLE_MODELS:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Model {model_name} not available. Available models: {list(AVAILABLE_MODELS.keys())}"
-        )
-    
-    request.model = model_name
-    return await chat(request)
-
-# Convenience endpoints for each model
-@app.post("/chat/qwen3", response_model=ChatResponse)
-async def chat_qwen3(request: ChatRequest):
-    """Chat with Qwen 3.0 30B model"""
-    request.model = "qwen3:30b"
-    return await chat(request)
-
-@app.post("/chat/devstral", response_model=ChatResponse) 
-async def chat_devstral(request: ChatRequest):
-    """Chat with DevStral model"""
-    request.model = "devstral"
-    return await chat(request)
-
-@app.post("/chat/gemma3", response_model=ChatResponse)
-async def chat_gemma3(request: ChatRequest):
-    """Chat with Gemma 3 model"""
-    request.model = "gemma3"
-    return await chat(request)
-
-@app.post("/chat/gpt-oss", response_model=ChatResponse)
-async def chat_gpt_oss(request: ChatRequest):
-    """Chat with GPT-OSS 20B model"""
-    request.model = "gpt-oss:20b"
-    return await chat(request)
-
 # Direct Ollama endpoint for testing (without LiteLLM)
 @app.post("/chat/direct", response_model=ChatResponse)
 async def chat_direct_ollama(request: ChatRequest):
@@ -473,6 +435,44 @@ async def chat_direct_ollama(request: ChatRequest):
                 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error with direct Ollama call: {str(e)}")
+
+# Specific model endpoints
+@app.post("/chat/{model_name}", response_model=ChatResponse)
+async def chat_with_specific_model(model_name: str, request: ChatRequest):
+    """Chat with a specific model by name"""
+    if model_name not in AVAILABLE_MODELS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Model {model_name} not available. Available models: {list(AVAILABLE_MODELS.keys())}"
+        )
+    
+    request.model = model_name
+    return await chat(request)
+
+# Convenience endpoints for each model
+@app.post("/chat/qwen3", response_model=ChatResponse)
+async def chat_qwen3(request: ChatRequest):
+    """Chat with Qwen 3.0 30B model"""
+    request.model = "qwen3:30b"
+    return await chat(request)
+
+@app.post("/chat/devstral", response_model=ChatResponse) 
+async def chat_devstral(request: ChatRequest):
+    """Chat with DevStral model"""
+    request.model = "devstral"
+    return await chat(request)
+
+@app.post("/chat/gemma3", response_model=ChatResponse)
+async def chat_gemma3(request: ChatRequest):
+    """Chat with Gemma 3 model"""
+    request.model = "gemma3"
+    return await chat(request)
+
+@app.post("/chat/gpt-oss", response_model=ChatResponse)
+async def chat_gpt_oss(request: ChatRequest):
+    """Chat with GPT-OSS 20B model"""
+    request.model = "gpt-oss:20b"
+    return await chat(request)
 
 @app.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(request: EmbeddingRequest):
