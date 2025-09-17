@@ -8,7 +8,7 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 
 ### Fase 1: Corrección Inmediata
 - [x] Actualizar modelo por defecto en .env a `DEFAULT_MODEL=qwen3:30b`
-- [x] Rebuild contenedor con cambios: `docker-compose down`, `docker-compose build --no-cache`, `docker-compose up -d`
+- [x] Rebuild contenedor con cambios: `docker-compose down`, `docker-compose build --no-cache`, `docker-compose up -d` (Acción manual, no un cambio de código)
 
 ### Fase 2: Configuración LiteLLM
 - [x] Configuración robusta en `app.py`:
@@ -32,9 +32,9 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 ## :portapapeles: ACCIONES REQUERIDAS (Desarrollador debe implementar)
 
 - [x] Investigar `gpt-oss:20b`: Por qué genera respuestas vacías
-- [ ] Configurar LiteLLM proxy standalone: Separar del FastAPI main
-- [ ] Implementar circuit breaker: Para modelos que fallan
-- [ ] Añadir logging estructurado: Con observabilidad completa
+- [x] Configurar LiteLLM proxy standalone: Separar del FastAPI main
+- [x] Implementar circuit breaker: Para modelos que fallan
+- [x] Añadir logging estructurado: Con observabilidad completa
 - [ ] Tests automatizados: Para cada modelo y endpoint
 
 ---

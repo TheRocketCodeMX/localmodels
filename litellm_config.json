@@ -1,0 +1,42 @@
+{
+  "model_list": [
+    {
+      "model_name": "gpt-oss:20b",
+      "litellm_params": {
+        "model": "ollama/gpt-oss:20b",
+        "api_base": "http://ollama:11434"
+      }
+    },
+    {
+      "model_name": "qwen3:30b",
+      "litellm_params": {
+        "model": "ollama/qwen3:30b",
+        "api_base": "http://ollama:11434"
+      }
+    },
+    {
+      "model_name": "devstral",
+      "litellm_params": {
+        "model": "ollama/devstral",
+        "api_base": "http://ollama:11434"
+      }
+    },
+    {
+      "model_name": "gemma3",
+      "litellm_params": {
+        "model": "ollama/gemma3",
+        "api_base": "http://ollama:11434"
+      }
+    }
+  ],
+  "general_settings": {
+    "litellm_verbose": true,
+    "drop_params": true,
+    "max_budget": 100,
+    "success_callback": ["langfuse"],
+    "failure_callback": ["langfuse"],
+    "ollama_api_key": "ollama",
+    "litellm_timeout": 600,
+    "litellm_retries": 3
+  }
+}

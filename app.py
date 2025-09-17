@@ -6,14 +6,48 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 import uvicorn
 import litellm
 from litellm import completion, acompletion
 from typing import Optional, List, Dict, Any
-import json # Added json import
+import json
+from logging_config import setup_logging # Import the setup_logging function
+from contextlib import asynccontextmanager
+# Gracefully import CircuitBreakerError from pybreaker; define fallback if not available
+import importlib
+try:
+    CircuitBreakerError = importlib.import_module("pybreaker").CircuitBreakerError  # type: ignore[attr-defined]
+except Exception:
+    class CircuitBreakerError(Exception):
+        pass
 
-app = FastAPI(title="Multi-Model API with LiteLLM", version="6.0.0")
+# Setup logging as early as possible
+logger = setup_logging()
+
+# Define FastAPI lifespan to replace deprecated on_event startup
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("🚀 Starting Multi-Model API Gateway with LiteLLM...")
+    # Wait for Ollama service
+    if not await wait_for_ollama():
+        raise RuntimeError("Could not connect to Ollama service")
+    # Setup clients
+    setup_ollama_client()
+    setup_litellm()
+    if use_litellm_proxy:
+        setup_litellm_proxy_client()
+    # Ensure models are available
+    await ensure_models_available()
+    logger.info("✅ Startup complete!")
+    logger.info("🌐 Local API URL: http://localhost:8000")
+    logger.info(f"🌐 LiteLLM Proxy: {litellm_proxy_url} (enabled={use_litellm_proxy})")
+    logger.info("🌐 Web UI URL: http://localhost:3000")
+    yield
+    # Shutdown (no-op for now)
+
+app = FastAPI(title="Multi-Model API with LiteLLM", version="6.0.0", lifespan=lifespan)
 
 # Add CORS middleware
 app.add_middleware(
@@ -26,6 +60,11 @@ app.add_middleware(
 
 # Configuration
 ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+# LiteLLM Proxy configuration (standalone proxy)
+use_litellm_proxy = os.getenv("USE_LITELLM_PROXY", "true").lower() in ("1", "true", "yes", "on")
+litellm_proxy_url = os.getenv("LITELLM_PROXY_URL", "http://litellm-proxy:4000")
+litellm_proxy_api_key = os.getenv("LITELLM_MASTER_KEY", "sk-1234")
+
 default_model = os.getenv("DEFAULT_MODEL", "gpt-oss:20b")
 
 # Available models configuration
@@ -56,18 +95,74 @@ AVAILABLE_MODELS = {
     }
 }
 
+# Simple async-friendly circuit breaker
+class AsyncCircuitBreaker:
+    def __init__(self, fail_max: int = 5, reset_timeout: float = 10.0, exclude: Optional[List[type]] = None):
+        self.fail_max = fail_max
+        self.reset_timeout = float(reset_timeout)
+        self.exclude = tuple(exclude or [])
+        self._fail_count = 0
+        self._open_until = 0.0
+
+    def _now(self) -> float:
+        return time.time()
+
+    def begin(self):
+        # Raise if currently open
+        if self.is_open():
+            raise CircuitBreakerError("Circuit breaker is open")
+
+    def is_open(self) -> bool:
+        # If in open state and not yet expired
+        if self._open_until and self._now() < self._open_until:
+            return True
+        # If open period elapsed, reset to closed
+        if self._open_until and self._now() >= self._open_until:
+            self._open_until = 0.0
+            self._fail_count = 0
+        return False
+
+    def success(self):
+        self._fail_count = 0
+        self._open_until = 0.0
+
+    def failure(self, exc: Exception | None = None):
+        # Do not trip on excluded exceptions
+        if exc and any(isinstance(exc, ex) for ex in self.exclude):
+            return
+        self._fail_count += 1
+        if self._fail_count >= self.fail_max:
+            self._open_until = self._now() + self.reset_timeout
+
+# Dictionary to hold breakers per model
+model_circuit_breakers = {}
+
+# Initialize CircuitBreakers for each model
+for model_key in AVAILABLE_MODELS.keys():
+    # Configure breaker: 5 failures, 10s reset timeout
+    model_circuit_breakers[model_key] = AsyncCircuitBreaker(
+        fail_max=5,
+        reset_timeout=10,
+        exclude=[HTTPException]  # Do not trip breaker on expected HTTPExceptions
+    )
+
 # Configure LiteLLM
-litellm.set_verbose = True  # Enable debug
+# litellm.set_verbose = True  # Removed: Deprecated
 litellm.drop_params = True
 litellm.max_budget = 100
-litellm.success_callback = ["langfuse"]
-litellm.failure_callback = ["langfuse"]
-# Turn on debug
-import litellm
-litellm._turn_on_debug()
+# Make Langfuse callbacks optional to avoid SDK incompatibility errors by default
+if os.getenv("ENABLE_LANGFUSE", "false").lower() in ("1", "true", "yes", "on"):  # opt-in
+    litellm.success_callback = ["langfuse"]
+    litellm.failure_callback = ["langfuse"]
+# Turn on debug - Removed: Deprecated
+# import litellm
+# litellm._turn_on_debug()
 
 # Ollama client for direct access
 ollama_client = None
+
+# LiteLLM Proxy async OpenAI client
+openai_proxy_client: AsyncOpenAI | None = None
 
 class ChatRequest(BaseModel):
     message: str
@@ -116,14 +211,14 @@ async def wait_for_ollama():
             async with httpx.AsyncClient() as client:
                 response = await client.get(f"{ollama_base_url}/api/tags")
                 if response.status_code == 200:
-                    print("✅ Ollama service is ready")
+                    logger.info("✅ Ollama service is ready")
                     return True
         except Exception as e:
-            print(f"⏳ Waiting for Ollama service... ({retry_count + 1}/{max_retries})")
+            logger.warning(f"⏳ Waiting for Ollama service... ({retry_count + 1}/{max_retries})")
             await asyncio.sleep(2)
             retry_count += 1
     
-    print("❌ Could not connect to Ollama service")
+    logger.error("❌ Could not connect to Ollama service")
     return False
 
 async def ensure_models_available():
@@ -140,8 +235,8 @@ async def ensure_models_available():
                 model_exists = any(model_name in existing for existing in existing_model_names)
                 
                 if not model_exists:
-                    print(f"📥 Downloading model {model_name}... This may take 10-30 minutes.")
-                    print(f"💡 Large models may require significant disk space and RAM")
+                    logger.info(f"📥 Downloading model {model_name}... This may take 10-30 minutes.")
+                    logger.info(f"💡 Large models may require significant disk space and RAM")
                     
                     pull_data = {"name": model_name, "stream": True}
                     
@@ -152,21 +247,21 @@ async def ensure_models_available():
                                     try:
                                         data = eval(line)
                                         if "status" in data:
-                                            print(f"📡 {model_name}: {data['status']}")
+                                            logger.info(f"📡 {model_name}: {data['status']}")
                                         if data.get("status") == "success":
-                                            print(f"✅ Model {model_name} downloaded successfully!")
+                                            logger.info(f"✅ Model {model_name} downloaded successfully!")
                                             break
                                     except:
                                         continue
                         else:
-                            print(f"⚠️ Failed to download model {model_name}. Status: {pull_response.status_code}")
+                            logger.warning(f"⚠️ Failed to download model {model_name}. Status: {pull_response.status_code}")
                 else:
-                    print(f"✅ Model {model_name} already available")
+                    logger.info(f"✅ Model {model_name} already available")
             
             return True
                 
     except Exception as e:
-        print(f"❌ Error ensuring model availability: {e}")
+        logger.error(f"❌ Error ensuring model availability: {e}")
         return True
 
 def setup_ollama_client():
@@ -177,38 +272,34 @@ def setup_ollama_client():
         base_url=f"{ollama_base_url}/v1",
         api_key="ollama"
     )
-    print("✅ Ollama client configured")
+    logger.info("✅ Ollama client configured")
 
 def setup_litellm():
     """Configure LiteLLM for Ollama"""
-    # Set the Ollama base URL for LiteLLM
+    # Set the Ollama base URL for LiteLLM (in-process) when not using proxy
     os.environ["OLLAMA_API_BASE"] = ollama_base_url
-    os.environ["OLLAMA_API_KEY"] = "ollama" # Added OLLAMA_API_KEY
+    os.environ["OLLAMA_API_KEY"] = "ollama"  # Added OLLAMA_API_KEY
+    os.environ['LITELLM_LOG'] = 'DEBUG'  # Added: Configure LiteLLM logging via env var
 
     # Removed global litellm.set_timeout and litellm.max_retries as they are not direct attributes
     # These will be passed directly to acompletion calls where needed.
 
-    print(f"✅ LiteLLM configured for Ollama")
+    logger.info(f"✅ LiteLLM configured for Ollama")
 
-@app.on_event("startup")
-async def startup_event():
-    print("🚀 Starting Multi-Model API Gateway with LiteLLM...")
-    
-    # Wait for Ollama service
-    if not await wait_for_ollama():
-        raise RuntimeError("Could not connect to Ollama service")
-    
-    # Setup clients
-    setup_ollama_client()
-    setup_litellm()
-    
-    # Ensure models are available
-    await ensure_models_available()
-    
-    print("✅ Startup complete!")
-    print("🌐 Local API URL: http://localhost:8000")
-    print("🌐 LiteLLM Proxy: http://localhost:4000") 
-    print("🌐 Web UI URL: http://localhost:3000")
+
+def setup_litellm_proxy_client():
+    """Setup Async OpenAI client pointing to the standalone LiteLLM proxy"""
+    global openai_proxy_client
+    try:
+        openai_proxy_client = AsyncOpenAI(
+            base_url=f"{litellm_proxy_url}/v1",
+            api_key=litellm_proxy_api_key
+        )
+        logger.info("✅ LiteLLM proxy client configured")
+    except Exception as e:
+        logger.error(f"❌ Failed to configure LiteLLM proxy client: {e}")
+        openai_proxy_client = None
+
 
 @app.get("/")
 async def root():
@@ -217,6 +308,8 @@ async def root():
         "default_model": default_model,
         "available_models": AVAILABLE_MODELS,
         "ollama_url": ollama_base_url,
+        "litellm_proxy_enabled": use_litellm_proxy,
+        "litellm_proxy_url": litellm_proxy_url,
         "endpoints": {
             "chat": "/chat",
             "chat_with_model": "/chat/{model_name}",
@@ -233,15 +326,29 @@ async def health():
         async with httpx.AsyncClient() as client:
             response = await client.get(f"{ollama_base_url}/api/tags")
             ollama_healthy = response.status_code == 200
-            
+
+        proxy_healthy = None
+        if use_litellm_proxy:
+            try:
+                headers = {"Authorization": f"Bearer {litellm_proxy_api_key}"}
+                async with httpx.AsyncClient() as client:
+                    proxy_resp = await client.get(f"{litellm_proxy_url}/v1/models", headers=headers, timeout=5)
+                    proxy_healthy = proxy_resp.status_code == 200
+            except Exception as _:
+                proxy_healthy = False
+
         return {
-            "status": "healthy" if ollama_healthy else "unhealthy",
+            "status": "healthy" if (ollama_healthy and (proxy_healthy in (None, True))) else "unhealthy",
             "ollama_service": "up" if ollama_healthy else "down",
+            "litellm_proxy_enabled": use_litellm_proxy,
+            "litellm_proxy_url": litellm_proxy_url,
+            "litellm_proxy_service": ("up" if proxy_healthy else "down") if proxy_healthy is not None else "n/a",
             "default_model": default_model,
             "available_models": list(AVAILABLE_MODELS.keys()),
             "litellm_enabled": True
         }
     except Exception as e:
+        logger.error(f"Error in /health endpoint: {e}")
         return {
             "status": "unhealthy",
             "ollama_service": "down",
@@ -256,6 +363,7 @@ async def list_models():
             response = await client.get(f"{ollama_base_url}/api/tags")
             return response.json()
     except Exception as e:
+        logger.error(f"Error fetching models: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching models: {str(e)}")
 
 @app.get("/health/models")
@@ -361,33 +469,139 @@ async def unified_completion(
     start_time = time.time() # Start timer
     success = False
 
-    if stream:
-        async def generate_stream():
-            nonlocal success # Allow modification of success in outer scope
-            try:
-                # Try LiteLLM streaming
-                litellm_response_generator = await acompletion(
-                    model=litellm_model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stream=True,
-                    api_base=ollama_base_url,
-                    timeout=litellm_timeout, # Pass timeout here
-                    num_retries=litellm_retries # Pass retries here
-                )
-                async for chunk in litellm_response_generator:
-                    yield chunk # Yield raw LiteLLM chunk object
-                success = True # Mark as success if stream completes without error
-            except Exception as litellm_error:
-                print(f"LiteLLM Streaming Error: {litellm_error}")
-                # Fallback to direct Ollama streaming
+    # Get the circuit breaker for this model
+    breaker = model_circuit_breakers.get(model_name_key)
+    if not breaker: # Should not happen if initialized correctly
+        logger.error(f"No circuit breaker found for model: {model_name_key}")
+        raise HTTPException(status_code=500, detail=f"Internal error: No circuit breaker for {model_name_key}")
+
+    try:
+        if stream:
+            async def generate_stream():
+                nonlocal success  # Allow modification of success in outer scope
+                # Ensure the breaker measures failures happening during stream consumption
+                breaker.begin()
                 try:
-                    async with httpx.AsyncClient(timeout=litellm_timeout) as client: # Use litellm_timeout for httpx
+                    primary_error = None
+                    if use_litellm_proxy:
+                        if openai_proxy_client is None:
+                            raise RuntimeError("LiteLLM proxy client not initialized")
+                        stream_resp = await openai_proxy_client.chat.completions.create(
+                            model=model_name_key,
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            stream=True,
+                        )
+                        async for chunk in stream_resp:
+                            yield chunk
+                        success = True
+                    else:
+                        # Try in-process LiteLLM streaming
+                        litellm_response_generator = await acompletion(
+                            model=litellm_model,
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            stream=True,
+                            api_base=ollama_base_url,
+                            timeout=litellm_timeout,  # Pass timeout here
+                            num_retries=litellm_retries  # Pass retries here
+                        )
+                        async for chunk in litellm_response_generator:
+                            yield chunk  # Yield raw LiteLLM chunk object
+                        success = True  # Mark as success if stream completes without error
+                except Exception as primary_error:
+                    logger.error(f"Primary Streaming Path Error: {primary_error}")
+                    # Fallback to direct Ollama streaming
+                    try:
+                        async with httpx.AsyncClient(timeout=litellm_timeout) as client:  # Use litellm_timeout for httpx
+                            # For direct Ollama, we need to reconstruct the prompt
+                            # Assuming the last message is the user's message
+                            ollama_prompt = f"Reasoning: {reasoning}\nUser: {messages[-1]['content']}\nAssistant:"
+
+                            ollama_request_payload = {
+                                "model": ollama_model_name,
+                                "prompt": ollama_prompt,
+                                "options": {
+                                    "num_predict": max_tokens,
+                                    "temperature": temperature
+                                },
+                                "stream": True
+                            }
+                            async with client.stream("POST", f"{ollama_base_url}/api/generate", json=ollama_request_payload) as direct_response:
+                                if direct_response.status_code == 200:
+                                    async for line in direct_response.aiter_lines():
+                                        if line:
+                                            try:
+                                                data = json.loads(line)
+                                                yield data  # Yield raw Ollama JSON dict per line
+                                                if data.get("done"):  # Check for done flag from Ollama direct
+                                                    success = True  # Mark as success if direct stream completes
+                                            except json.JSONDecodeError:
+                                                continue
+                                else:
+                                    logger.error(
+                                        f"Direct Ollama Streaming Fallback Failed: {direct_response.status_code} - {await direct_response.text()}"
+                                    )
+                                    raise HTTPException(
+                                        status_code=500,
+                                        detail=f"Both primary and direct Ollama streaming failed. Status: {direct_response.status_code}"
+                                    )
+                    except Exception as fallback_error:
+                        logger.error(f"Direct Ollama Streaming Fallback Exception: {fallback_error}")
+                        # Re-raise to be caught by breaker and increment failure count
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"All streaming methods failed: Primary: {primary_error}, Direct: {fallback_error}"
+                        )
+                finally:
+                    end_time = time.time()  # End timer for streaming
+                    latency_ms = (end_time - start_time) * 1000
+                    logger.info(
+                        f"METRIC: Model={model_name_key}, Type=Streaming, Latency={latency_ms:.2f}ms, Success={success}"
+                    )
+                    if success:
+                        breaker.success()
+                    else:
+                        breaker.failure()
+            return generate_stream()
+        else:
+            # Non-streaming path: guard the actual call with the breaker
+            breaker.begin()
+            try:
+                if use_litellm_proxy:
+                    if openai_proxy_client is None:
+                        raise RuntimeError("LiteLLM proxy client not initialized")
+                    response = await openai_proxy_client.chat.completions.create(
+                        model=model_name_key,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        stream=False,
+                    )
+                else:
+                    # Try in-process LiteLLM non-streaming
+                    response = await acompletion(
+                        model=litellm_model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        api_base=ollama_base_url,
+                        timeout=litellm_timeout,  # Pass timeout here
+                        num_retries=litellm_retries  # Pass retries here
+                    )
+                success = True
+                breaker.success()
+                return response  # Return response object
+            except Exception as primary_error:
+                logger.error(f"Primary Non-Streaming Path Error: {primary_error}")
+                # Fallback to direct Ollama non-streaming
+                try:
+                    async with httpx.AsyncClient(timeout=litellm_timeout) as client:  # Use litellm_timeout for httpx
                         # For direct Ollama, we need to reconstruct the prompt
-                        # Assuming the last message is the user's message
                         ollama_prompt = f"Reasoning: {reasoning}\nUser: {messages[-1]['content']}\nAssistant:"
-                        
+
                         ollama_request_payload = {
                             "model": ollama_model_name,
                             "prompt": ollama_prompt,
@@ -395,76 +609,47 @@ async def unified_completion(
                                 "num_predict": max_tokens,
                                 "temperature": temperature
                             },
-                            "stream": True
+                            "stream": False
                         }
-                        async with client.stream("POST", f"{ollama_base_url}/api/generate", json=ollama_request_payload) as direct_response:
-                            if direct_response.status_code == 200:
-                                async for line in direct_response.aiter_lines():
-                                    if line:
-                                        try:
-                                            data = json.loads(line)
-                                            yield data # Yield raw Ollama JSON dict per line
-                                            if data.get("done"): # Check for done flag from Ollama direct
-                                                success = True # Mark as success if direct stream completes
-                                        except json.JSONDecodeError:
-                                            continue
-                            else:
-                                print(f"Direct Ollama Streaming Fallback Failed: {direct_response.status_code} - {await direct_response.text()}")
-                                raise HTTPException(status_code=500, detail=f"Both LiteLLM and direct Ollama streaming failed. Status: {direct_response.status_code}")
+                        direct_response = await client.post(
+                            f"{ollama_base_url}/api/generate",
+                            json=ollama_request_payload
+                        )
+                        if direct_response.status_code == 200:
+                            success = True
+                            breaker.success()
+                            return direct_response.json()  # Return direct Ollama JSON response
+                        else:
+                            logger.error(
+                                f"Direct Ollama Fallback Failed: {direct_response.status_code} - {await direct_response.text()}"
+                            )
+                            breaker.failure()
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Both primary and direct Ollama failed. Status: {direct_response.status_code}"
+                            )
                 except Exception as fallback_error:
-                    print(f"Direct Ollama Streaming Fallback Exception: {fallback_error}")
-                    raise HTTPException(status_code=500, detail=f"All streaming methods failed: LiteLLM: {litellm_error}, Direct: {fallback_error}")
-            finally:
-                end_time = time.time() # End timer for streaming
-                latency_ms = (end_time - start_time) * 1000
-                print(f"METRIC: Model={model_name_key}, Type=Streaming, Latency={latency_ms:.2f}ms, Success={success}")
-        return generate_stream()
-    else:
-        try:
-            # Try LiteLLM non-streaming
-            response = await acompletion(
-                model=litellm_model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                api_base=ollama_base_url,
-                timeout=litellm_timeout, # Pass timeout here
-                num_retries=litellm_retries # Pass retries here
-            )
-            success = True
-            return response # Return LiteLLM response object
-        except Exception as litellm_error:
-            print(f"LiteLLM Error: {litellm_error}")
-            # Fallback to direct Ollama non-streaming
-            try:
-                async with httpx.AsyncClient(timeout=litellm_timeout) as client: # Use litellm_timeout for httpx
-                    # For direct Ollama, we need to reconstruct the prompt
-                    ollama_prompt = f"Reasoning: {reasoning}\nUser: {messages[-1]['content']}\nAssistant:"
-                    
-                    ollama_request_payload = {
-                        "model": ollama_model_name,
-                        "prompt": ollama_prompt,
-                        "options": {
-                            "num_predict": max_tokens,
-                            "temperature": temperature
-                        },
-                        "stream": False
-                    }
-                    direct_response = await client.post(
-                        f"{ollama_base_url}/api/generate",
-                        json=ollama_request_payload
+                    logger.error(f"Direct Ollama Fallback Exception: {fallback_error}")
+                    # Mark failure and re-raise to be caught by API layer
+                    breaker.failure(fallback_error)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"All methods failed: Primary: {primary_error}, Direct: {fallback_error}"
                     )
-                    if direct_response.status_code == 200:
-                        success = True
-                        return direct_response.json() # Return direct Ollama JSON response
-                    else:
-                        raise HTTPException(status_code=500, detail=f"Both LiteLLM and direct Ollama failed. Status: {direct_response.status_code}")
-            except Exception as fallback_error:
-                raise HTTPException(status_code=500, detail=f"All methods failed: LiteLLM: {litellm_error}, Direct: {fallback_error}")
-        finally:
-            end_time = time.time() # End timer for non-streaming
-            latency_ms = (end_time - start_time) * 1000
-            print(f"METRIC: Model={model_name_key}, Type=Non-Streaming, Latency={latency_ms:.2f}ms, Success={success}")
+            finally:
+                end_time = time.time()  # End timer for non-streaming
+                latency_ms = (end_time - start_time) * 1000
+                logger.info(
+                    f"METRIC: Model={model_name_key}, Type=Non-Streaming, Latency={latency_ms:.2f}ms, Success={success}"
+                )
+
+    except CircuitBreakerError:
+        logger.warning(f"Circuit breaker is OPEN for model: {model_name_key}. Skipping request.")
+        raise HTTPException(status_code=503, detail=f"Model {model_name_key} is temporarily unavailable (circuit breaker is open).")
+    except Exception as e:
+        # Any other unexpected error will trip the breaker
+        logger.error(f"Unexpected error in unified_completion for {model_name_key}: {e}")
+        raise e # Re-raise to let the breaker count this as a failure
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -652,9 +837,11 @@ async def chat_direct_ollama(request: ChatRequest):
                     }
                 )
             else:
+                logger.error(f"Ollama API error: {response.status_code}")
                 raise HTTPException(status_code=500, detail=f"Ollama API error: {response.status_code}")
                 
     except Exception as e:
+        logger.error(f"Error with direct Ollama call: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error with direct Ollama call: {str(e)}")
 
 @app.post("/debug/litellm/{model_name}", include_in_schema=False)
@@ -1128,11 +1315,11 @@ async def debug_litellm_model(model_name: str, request: ChatRequest) -> Response
 
     start_time = time.time()
     try:
-        print(f"--- Initiating Enhanced LiteLLM debug for model: {litellm_model_name} ---")
+        logger.info(f"--- Initiating Enhanced LiteLLM debug for model: {litellm_model_name} ---")
         response_obj = await acompletion(**request_payload)
         end_time = time.time()
         latency_ms = (end_time - start_time) * 1000
-        print(f"--- LiteLLM debug successful (Latency: {latency_ms:.2f} ms) ---")
+        logger.info(f"--- LiteLLM debug successful (Latency: {latency_ms:.2f} ms) ---")
 
         # Step 3: Second pass to refresh runtime info post-execution
         post_info, post_warn = await gather_runtime_info()
@@ -1182,7 +1369,7 @@ async def debug_litellm_model(model_name: str, request: ChatRequest) -> Response
     except Exception as e:
         end_time = time.time()
         latency_ms = (end_time - start_time) * 1000
-        print(f"--- LiteLLM debug FAILED (Latency: {latency_ms:.2f} ms) ---")
+        logger.error(f"--- LiteLLM debug FAILED (Latency: {latency_ms:.2f} ms) ---")
 
         # Step 3: Assemble the final error response
         error_content = {
@@ -1282,7 +1469,7 @@ async def create_embeddings(request: EmbeddingRequest):
                     
                     total_tokens += len(text.split())
                 else:
-                    print(f"⚠️ Ollama embeddings not available, using dummy embedding for: {text[:50]}...")
+                    logger.warning(f"⚠️ Ollama embeddings not available, using dummy embedding for: {text[:50]}...")
                     embedding_data.append(EmbeddingData(
                         index=i,
                         embedding=[0.0] * 1536
@@ -1301,10 +1488,12 @@ async def create_embeddings(request: EmbeddingRequest):
         )
         
     except Exception as e:
+        logger.error(f"Error generating embeddings: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating embeddings: {str(e)}")
 
 if __name__ == "__main__":
-    print("🚀 Starting Multi-Model API Gateway with LiteLLM...")
-    print("🌐 Local API URL: http://localhost:8000")
-    print("🌐 Web UI URL: http://localhost:3000")
+    logger.info("🚀 Starting Multi-Model API Gateway with LiteLLM...")
+    logger.info("🌐 Local API URL: http://localhost:8000")
+    logger.info("🌐 Web UI URL: http://localhost:3000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
