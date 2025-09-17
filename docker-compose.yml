@@ -28,7 +28,7 @@ services:
       - ollama
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
-      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-oss:20b}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen3:30b}
     restart: unless-stopped
 
   # Optional: Web UI for testing

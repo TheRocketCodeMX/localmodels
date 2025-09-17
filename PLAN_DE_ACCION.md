@@ -11,13 +11,13 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 - [ ] Rebuild contenedor con cambios: `docker-compose down`, `docker-compose build --no-cache`, `docker-compose up -d`
 
 ### Fase 2: Configuración LiteLLM
-- [ ] Configuración robusta en `app.py`:
-    - [ ] `litellm.set_verbose = True`
-    - [ ] `litellm.drop_params = True`
-    - [ ] `litellm.max_budget = 100`
-    - [ ] `litellm.success_callback = ["langfuse"]`
-    - [ ] `litellm.failure_callback = ["langfuse"]`
-- [ ] Variables de entorno correctas: `os.environ["OLLAMA_API_BASE"] = ollama_base_url`, `os.environ["OLLAMA_API_KEY"] = "ollama"`
+- [x] Configuración robusta en `app.py`:
+    - [x] `litellm.set_verbose = True`
+    - [x] `litellm.drop_params = True`
+    - [x] `litellm.max_budget = 100`
+    - [x] `litellm.success_callback = ["langfuse"]`
+    - [x] `litellm.failure_callback = ["langfuse"]`
+- [x] Variables de entorno correctas: `os.environ["OLLAMA_API_BASE"] = ollama_base_url`, `os.environ["OLLAMA_API_KEY"] = "ollama"`
 
 ### Fase 3: Manejo de Errores
 - [ ] Implementar fallback robusto (`async def unified_completion(model, messages, **kwargs): ...` para intentar LiteLLM primero y luego Ollama directo)
@@ -41,7 +41,7 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 
 ## :dardo: PRÓXIMOS PASOS INMEDIATOS (Consolidado)
 
-- [ ] Configurar LiteLLM con timeout y retry policies
+- [x] Configurar LiteLLM con timeout y retry policies
 - [ ] Investigar incompatibilidad específica con `gpt-oss:20b`
 - [ ] Documentar formato de respuesta esperado vs actual
 
@@ -51,5 +51,5 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 
 - [ ] `app.py:278-321` - Lógica fallback LiteLLM
 - [ ] `app.py:49-54` - Configuración LiteLLM
-- [ ] `docker-compose.yml:30-31` - Variables de entorno
+- [x] `docker-compose.yml:30-31` - Variables de entorno
 - [ ] `.env:5` - Modelo por defecto

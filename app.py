@@ -58,6 +58,9 @@ AVAILABLE_MODELS = {
 # Configure LiteLLM
 litellm.set_verbose = True  # Enable debug
 litellm.drop_params = True
+litellm.max_budget = 100
+litellm.success_callback = ["langfuse"]
+litellm.failure_callback = ["langfuse"]
 # Turn on debug
 import litellm
 litellm._turn_on_debug()
@@ -179,7 +182,16 @@ def setup_litellm():
     """Configure LiteLLM for Ollama"""
     # Set the Ollama base URL for LiteLLM
     os.environ["OLLAMA_API_BASE"] = ollama_base_url
-    print("✅ LiteLLM configured for Ollama")
+    os.environ["OLLAMA_API_KEY"] = "ollama" # Added OLLAMA_API_KEY
+
+    # Configure global LiteLLM timeout and retries
+    litellm_timeout = int(os.getenv("LITELLM_TIMEOUT", 600)) # Default to 600 seconds (10 minutes)
+    litellm_retries = int(os.getenv("LITELLM_RETRIES", 3)) # Default to 3 retries
+
+    litellm.set_timeout(litellm_timeout)
+    litellm.max_retries = litellm_retries
+
+    print(f"✅ LiteLLM configured for Ollama with timeout={litellm_timeout}s and retries={litellm_retries}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -711,7 +723,7 @@ async def debug_litellm_model(model_name: str, request: ChatRequest) -> Response
                         pass
                 # If still ambiguous, infer from libraries and layers
                 if detected_mode == "CPU":
-                    if ("cuda" in library or "rocm" in library or library == "gpu") or gpu_name:
+                    if (("cuda" in library or "rocm" in library or library == "gpu") or gpu_name):
                         if total_layers and 0 < offloaded_layers < total_layers:
                             detected_mode = "Hybrid (CPU+GPU)"
                         elif total_layers and offloaded_layers >= total_layers > 0:
