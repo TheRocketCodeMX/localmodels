@@ -8,7 +8,7 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 
 ### Fase 1: Corrección Inmediata
 - [x] Actualizar modelo por defecto en .env a `DEFAULT_MODEL=qwen3:30b`
-- [ ] Rebuild contenedor con cambios: `docker-compose down`, `docker-compose build --no-cache`, `docker-compose up -d`
+- [x] Rebuild contenedor con cambios: `docker-compose down`, `docker-compose build --no-cache`, `docker-compose up -d`
 
 ### Fase 2: Configuración LiteLLM
 - [x] Configuración robusta en `app.py`:
@@ -20,11 +20,11 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 - [x] Variables de entorno correctas: `os.environ["OLLAMA_API_BASE"] = ollama_base_url`, `os.environ["OLLAMA_API_KEY"] = "ollama"`
 
 ### Fase 3: Manejo de Errores
-- [ ] Implementar fallback robusto (`async def unified_completion(model, messages, **kwargs): ...` para intentar LiteLLM primero y luego Ollama directo)
+- [x] Implementar fallback robusto (`async def unified_completion(model, messages, **kwargs): ...` para intentar LiteLLM primero y luego Ollama directo)
 
 ### Fase 4: Monitoreo y Salud
-- [ ] Endpoint `/debug/models` para verificar estado de cada modelo
-- [ ] Health checks individuales por modelo
+- [x] Endpoint `/debug/models` para verificar estado de cada modelo
+- [x] Health checks individuales por modelo
 - [ ] Métricas de latencia y success rate
 
 ---
@@ -42,14 +42,14 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 ## :dardo: PRÓXIMOS PASOS INMEDIATOS (Consolidado)
 
 - [x] Configurar LiteLLM con timeout y retry policies
-- [ ] Investigar incompatibilidad específica con `gpt-oss:20b`
+- [x] Investigar incompatibilidad específica con `gpt-oss:20b`
 - [ ] Documentar formato de respuesta esperado vs actual
 
 ---
 
 ## :mag_right: Archivos Críticos para Revisar
 
-- [ ] `app.py:278-321` - Lógica fallback LiteLLM
-- [ ] `app.py:49-54` - Configuración LiteLLM
+- [x] `app.py:278-321` - Lógica fallback LiteLLM
+- [x] `app.py:49-54` - Configuración LiteLLM
 - [x] `docker-compose.yml:30-31` - Variables de entorno
-- [ ] `.env:5` - Modelo por defecto
+- [x] `.env:5` - Modelo por defecto

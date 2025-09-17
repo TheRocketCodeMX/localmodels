@@ -11,6 +11,7 @@ import uvicorn
 import litellm
 from litellm import completion, acompletion
 from typing import Optional, List, Dict, Any
+import json # Added json import
 
 app = FastAPI(title="Multi-Model API with LiteLLM", version="6.0.0")
 
@@ -184,14 +185,10 @@ def setup_litellm():
     os.environ["OLLAMA_API_BASE"] = ollama_base_url
     os.environ["OLLAMA_API_KEY"] = "ollama" # Added OLLAMA_API_KEY
 
-    # Configure global LiteLLM timeout and retries
-    litellm_timeout = int(os.getenv("LITELLM_TIMEOUT", 600)) # Default to 600 seconds (10 minutes)
-    litellm_retries = int(os.getenv("LITELLM_RETRIES", 3)) # Default to 3 retries
+    # Removed global litellm.set_timeout and litellm.max_retries as they are not direct attributes
+    # These will be passed directly to acompletion calls where needed.
 
-    litellm.set_timeout(litellm_timeout)
-    litellm.max_retries = litellm_retries
-
-    print(f"✅ LiteLLM configured for Ollama with timeout={litellm_timeout}s and retries={litellm_retries}")
+    print(f"✅ LiteLLM configured for Ollama")
 
 @app.on_event("startup")
 async def startup_event():
@@ -261,92 +258,196 @@ async def list_models():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching models: {str(e)}")
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """Chat endpoint using LiteLLM"""
-    selected_model = request.model if request.model and request.model in AVAILABLE_MODELS else default_model
-    
-    try:
-        # Get the LiteLLM model name
-        litellm_model = AVAILABLE_MODELS[selected_model]["litellm_name"]
-        
-        # Format message with reasoning level
-        messages = [
-            {"role": "system", "content": f"You are a helpful assistant. Reasoning: {request.reasoning}"},
-            {"role": "user", "content": request.message}
-        ]
-        
-        if request.stream:
-            # Handle streaming with LiteLLM
-            async def generate():
-                try:
-                    response = await acompletion(
-                        model=litellm_model,
-                        messages=messages,
-                        max_tokens=request.max_tokens,
-                        temperature=request.temperature,
-                        stream=True,
-                        api_base=ollama_base_url
-                    )
-                    
-                    async for chunk in response:
-                        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
-                            yield f"data: {chunk.choices[0].delta.content}\n\n"
-                    yield "data: [DONE]\n\n"
-                except Exception as e:
-                    yield f"data: Error: {str(e)}\n\n"
-            
-            return StreamingResponse(generate(), media_type="text/plain")
-        else:
-            # Handle regular response with LiteLLM
+@app.get("/health/models")
+async def health_models():
+    """Check the health status of each configured model in Ollama"""
+    model_health_statuses = {}
+    async with httpx.AsyncClient() as client:
+        for model_key, model_info in AVAILABLE_MODELS.items():
+            model_name = model_info["name"]
             try:
-                response = await acompletion(
+                # Attempt to get model details from Ollama using /api/show
+                # This endpoint returns details if the model exists, even if not loaded.
+                response = await client.post(f"{ollama_base_url}/api/show", json={"name": model_name}, timeout=10)
+                if response.status_code == 200:
+                    # Extract only relevant info for health check
+                    details = response.json()
+                    model_health_statuses[model_name] = {
+                        "status": "healthy",
+                        "ollama_status": "available",
+                        "size": details.get("size"),
+                        "quantization": details.get("details", {}).get("quantization_level"),
+                        "family": details.get("details", {}).get("family"),
+                        "description": model_info.get("description")
+                    }
+                elif response.status_code == 404: # Model not found in Ollama
+                    model_health_statuses[model_name] = {"status": "unhealthy", "ollama_status": "not_found", "error": "Model not found in Ollama"}
+                else:
+                    model_health_statuses[model_name] = {"status": "unhealthy", "ollama_status": "api_error", "error": f"Ollama API returned status {response.status_code}"}
+            except httpx.RequestError as e:
+                model_health_statuses[model_name] = {"status": "unhealthy", "ollama_status": "network_error", "error": f"Network or request error: {str(e)}"}
+            except Exception as e:
+                model_health_statuses[model_name] = {"status": "unhealthy", "ollama_status": "unexpected_error", "error": f"Unexpected error: {str(e)}"}
+    return JSONResponse(content=model_health_statuses)
+
+
+async def unified_completion(
+    model_name_key: str, # Key from AVAILABLE_MODELS, e.g., "gpt-oss:20b"
+    messages: List[Dict[str, str]], # Already formatted with system prompt if needed
+    max_tokens: int,
+    temperature: float,
+    stream: bool,
+    reasoning: str, # Passed from ChatRequest, used for direct Ollama prompt
+    ollama_base_url: str
+):
+    selected_model_info = AVAILABLE_MODELS[model_name_key]
+    litellm_model = selected_model_info["litellm_name"]
+    ollama_model_name = selected_model_info["name"] # Actual Ollama model name
+
+    # Get timeout and retries from environment variables, with defaults
+    litellm_timeout = int(os.getenv("LITELLM_TIMEOUT", 600)) # Default to 600 seconds (10 minutes)
+    litellm_retries = int(os.getenv("LITELLM_RETRIES", 3)) # Default to 3 retries
+
+    if stream:
+        async def generate_stream():
+            try:
+                # Try LiteLLM streaming
+                litellm_response_generator = await acompletion(
                     model=litellm_model,
                     messages=messages,
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=True,
                     api_base=ollama_base_url,
-                    timeout=180 # Increased timeout
+                    timeout=litellm_timeout, # Pass timeout here
+                    num_retries=litellm_retries # Pass retries here
                 )
+                async for chunk in litellm_response_generator:
+                    yield chunk # Yield raw LiteLLM chunk object
             except Exception as litellm_error:
-                print(f"LiteLLM Error: {litellm_error}")
-                # Fallback: try direct Ollama call
+                print(f"LiteLLM Streaming Error: {litellm_error}")
+                # Fallback to direct Ollama streaming
                 try:
-                    async with httpx.AsyncClient(timeout=180.0) as client: # Increased timeout
-                        ollama_request = {
-                            "model": selected_model,
-                            "prompt": request.message,
+                    async with httpx.AsyncClient(timeout=litellm_timeout) as client: # Use litellm_timeout for httpx
+                        # For direct Ollama, we need to reconstruct the prompt
+                        # Assuming the last message is the user's message
+                        ollama_prompt = f"Reasoning: {reasoning}\nUser: {messages[-1]['content']}\nAssistant:"
+                        
+                        ollama_request_payload = {
+                            "model": ollama_model_name,
+                            "prompt": ollama_prompt,
                             "options": {
-                                "num_predict": request.max_tokens,
-                                "temperature": request.temperature
+                                "num_predict": max_tokens,
+                                "temperature": temperature
                             },
-                            "stream": False
+                            "stream": True
                         }
-                        
-                        direct_response = await client.post(
-                            f"{ollama_base_url}/api/generate",
-                            json=ollama_request
-                        )
-                        
-                        if direct_response.status_code == 200:
-                            result = direct_response.json()
-                            return ChatResponse(
-                                response=result.get("response", ""),
-                                model=selected_model,
-                                usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                            )
-                        else:
-                            raise HTTPException(status_code=500, detail="Both LiteLLM and direct Ollama failed")
-                            
+                        async with client.stream("POST", f"{ollama_base_url}/api/generate", json=ollama_request_payload) as direct_response:
+                            if direct_response.status_code == 200:
+                                async for line in direct_response.aiter_lines():
+                                    if line:
+                                        try:
+                                            data = json.loads(line)
+                                            yield data # Yield raw Ollama JSON dict per line
+                                        except json.JSONDecodeError:
+                                            continue
+                            else:
+                                print(f"Direct Ollama Streaming Fallback Failed: {direct_response.status_code} - {await direct_response.text()}")
+                                raise HTTPException(status_code=500, detail=f"Both LiteLLM and direct Ollama streaming failed. Status: {direct_response.status_code}")
                 except Exception as fallback_error:
-                    raise HTTPException(status_code=500, detail=f"All methods failed: LiteLLM: {litellm_error}, Direct: {fallback_error}")
-            
-            content = response.choices[0].message.content
-            usage_info = {
-                "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
-                "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
-                "total_tokens": getattr(response.usage, 'total_tokens', 0)
-            } if hasattr(response, 'usage') and response.usage else {}
+                    print(f"Direct Ollama Streaming Fallback Exception: {fallback_error}")
+                    raise HTTPException(status_code=500, detail=f"All streaming methods failed: LiteLLM: {litellm_error}, Direct: {fallback_error}")
+        return generate_stream()
+    else:
+        try:
+            # Try LiteLLM non-streaming
+            response = await acompletion(
+                model=litellm_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                api_base=ollama_base_url,
+                timeout=litellm_timeout, # Pass timeout here
+                num_retries=litellm_retries # Pass retries here
+            )
+            return response # Return LiteLLM response object
+        except Exception as litellm_error:
+            print(f"LiteLLM Error: {litellm_error}")
+            # Fallback to direct Ollama non-streaming
+            try:
+                async with httpx.AsyncClient(timeout=litellm_timeout) as client: # Use litellm_timeout for httpx
+                    # For direct Ollama, we need to reconstruct the prompt
+                    ollama_prompt = f"Reasoning: {reasoning}\nUser: {messages[-1]['content']}\nAssistant:"
+                    
+                    ollama_request_payload = {
+                        "model": ollama_model_name,
+                        "prompt": ollama_prompt,
+                        "options": {
+                            "num_predict": max_tokens,
+                            "temperature": temperature
+                        },
+                        "stream": False
+                    }
+                    direct_response = await client.post(
+                        f"{ollama_base_url}/api/generate",
+                        json=ollama_request_payload
+                    )
+                    if direct_response.status_code == 200:
+                        return direct_response.json() # Return direct Ollama JSON response
+                    else:
+                        raise HTTPException(status_code=500, detail=f"Both LiteLLM and direct Ollama failed. Status: {direct_response.status_code}")
+            except Exception as fallback_error:
+                raise HTTPException(status_code=500, detail=f"All methods failed: LiteLLM: {litellm_error}, Direct: {fallback_error}")
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Chat endpoint using LiteLLM with robust fallback"""
+    selected_model = request.model if request.model and request.model in AVAILABLE_MODELS else default_model
+    
+    # Format message with reasoning level for unified_completion
+    messages_for_completion = [
+        {"role": "system", "content": f"You are a helpful assistant. Reasoning: {request.reasoning}"},
+        {"role": "user", "content": request.message}
+    ]
+    
+    try:
+        completion_result = await unified_completion(
+            model_name_key=selected_model,
+            messages=messages_for_completion,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            stream=request.stream,
+            reasoning=request.reasoning,
+            ollama_base_url=ollama_base_url
+        )
+        
+        if request.stream:
+            async def generate_formatted_stream():
+                async for chunk in completion_result:
+                    if hasattr(chunk, 'choices') and chunk.choices[0].delta.content:
+                        yield f"data: {chunk.choices[0].delta.content}\n\n" # LiteLLM chunk
+                    elif "response" in chunk: # Direct Ollama chunk
+                        yield f"data: {chunk['response']}\n\n"
+                    if hasattr(chunk, 'choices') and chunk.choices[0].finish_reason or chunk.get("done"): # Check for finish reason or done flag
+                        yield "data: [DONE]\n\n"
+            return StreamingResponse(generate_formatted_stream(), media_type="text/plain")
+        else:
+            # Check if it's a LiteLLM response object or direct Ollama JSON
+            if hasattr(completion_result, 'choices'): # LiteLLM response
+                content = completion_result.choices[0].message.content
+                usage_info = {
+                    "prompt_tokens": getattr(completion_result.usage, 'prompt_tokens', 0),
+                    "completion_tokens": getattr(completion_result.usage, 'completion_tokens', 0),
+                    "total_tokens": getattr(completion_result.usage, 'total_tokens', 0)
+                } if hasattr(completion_result, 'usage') and completion_result.usage else {}
+            else: # Direct Ollama JSON response
+                content = completion_result.get("response", "")
+                usage_info = {
+                    "prompt_tokens": completion_result.get("prompt_eval_count", 0),
+                    "completion_tokens": completion_result.get("eval_count", 0),
+                    "total_tokens": completion_result.get("prompt_eval_count", 0) + completion_result.get("eval_eval_count", 0)
+                }
             
             return ChatResponse(
                 response=content,
@@ -354,13 +455,15 @@ async def chat(request: ChatRequest):
                 usage=usage_info
             )
         
+    except HTTPException as e:
+        raise e # Re-raise HTTPExceptions from unified_completion
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating response with LiteLLM model {selected_model}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating response with model {selected_model}: {str(e)}")
 
 # OpenAI-compatible endpoint using LiteLLM
 @app.post("/v1/chat/completions")
 async def litellm_chat_completions(request: OpenAIChatRequest):
-    """OpenAI-compatible endpoint using LiteLLM"""
+    """OpenAI-compatible endpoint using LiteLLM with robust fallback"""
     try:
         # Validate model
         if request.model not in AVAILABLE_MODELS:
@@ -369,46 +472,85 @@ async def litellm_chat_completions(request: OpenAIChatRequest):
                 detail=f"Model {request.model} not available. Available models: {list(AVAILABLE_MODELS.keys())}"
             )
         
-        # Get the LiteLLM model name
-        litellm_model = AVAILABLE_MODELS[request.model]["litellm_name"]
+        # OpenAIChatRequest messages are already in the correct format for LiteLLM
+        # For direct Ollama fallback, we'll use a default reasoning if not explicitly in messages.
+        default_reasoning = "medium"
+        for msg in request.messages:
+            if msg["role"] == "system" and "Reasoning:" in msg["content"]:
+                try:
+                    default_reasoning = msg["content"].split("Reasoning:")[1].strip().split(" ")[0] # Extract first word after Reasoning:
+                except IndexError:
+                    pass
+                break
+
+        completion_result = await unified_completion(
+            model_name_key=request.model,
+            messages=request.messages,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            stream=request.stream,
+            reasoning=default_reasoning, # Use extracted or default reasoning
+            ollama_base_url=ollama_base_url
+        )
         
         if request.stream:
-            # Handle streaming
-            async def generate():
-                try:
-                    response = await acompletion(
-                        model=litellm_model,
-                        messages=request.messages,
-                        max_tokens=request.max_tokens,
-                        temperature=request.temperature,
-                        stream=True,
-                        api_base=ollama_base_url
-                    )
-                    
-                    async for chunk in response:
+            async def generate_formatted_stream():
+                async for chunk in completion_result:
+                    # LiteLLM chunk objects are already in a format that can be dumped
+                    # Direct Ollama chunks are dicts that need to be wrapped
+                    if hasattr(chunk, 'choices'): # LiteLLM chunk
                         yield f"data: {chunk.model_dump_json()}\n\n"
-                    yield "data: [DONE]\n\n"
-                except Exception as e:
-                    yield f"data: {{'error': '{str(e)}'}}\n\n"
-            
-            return StreamingResponse(generate(), media_type="text/plain")
+                    elif "response" in chunk: # Direct Ollama chunk
+                        # Reconstruct a basic OpenAI-like chunk for direct Ollama fallback
+                        ollama_chunk = {
+                            "id": "chatcmpl-ollama-fallback",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": request.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk["response"]},
+                                    "finish_reason": "stop" if chunk.get("done") else None
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(ollama_chunk)}\n\n"
+                    if chunk.get("done"): # Check for done flag from Ollama direct
+                        yield "data: [DONE]\n\n"
+            return StreamingResponse(generate_formatted_stream(), media_type="text/event-stream") # Changed media_type for OpenAI-compatible streaming
         else:
-            # Handle regular response
-            response = await acompletion(
-                model=litellm_model,
-                messages=request.messages,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                api_base=ollama_base_url,
-                timeout=180 # Increased timeout
-            )
-            
-            return response.model_dump()
+            # Check if it's a LiteLLM response object or direct Ollama JSON
+            if hasattr(completion_result, 'choices'): # LiteLLM response
+                return completion_result.model_dump()
+            else: # Direct Ollama JSON response
+                # Reconstruct a basic OpenAI-like response for direct Ollama fallback
+                ollama_response = {
+                    "id": "chatcmpl-ollama-fallback",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": completion_result.get("response", "")},
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": completion_result.get("prompt_eval_count", 0),
+                        "completion_tokens": completion_result.get("eval_count", 0),
+                        "total_tokens": completion_result.get("prompt_eval_count", 0) + completion_result.get("eval_eval_count", 0)
+                    }
+                }
+                return ollama_response
         
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in LiteLLM endpoint: {str(e)}")
 
-# Direct Ollama endpoint for testing (without LiteLLM)
+# Direct Ollama endpoint for testing (without LiteLLM) - This endpoint remains unchanged as it's direct Ollama
 @app.post("/chat/direct", response_model=ChatResponse)
 async def chat_direct_ollama(request: ChatRequest):
     """Direct chat with Ollama (bypassing LiteLLM)"""
@@ -439,7 +581,7 @@ async def chat_direct_ollama(request: ChatRequest):
                     usage={
                         "prompt_tokens": result.get("prompt_eval_count", 0),
                         "completion_tokens": result.get("eval_count", 0),
-                        "total_tokens": result.get("prompt_eval_count", 0) + result.get("eval_count", 0)
+                        "total_tokens": result.get("prompt_eval_count", 0) + result.get("eval_eval_count", 0)
                     }
                 )
             else:
@@ -1007,6 +1149,7 @@ async def chat_with_specific_model(model_name: str, request: ChatRequest):
         )
     
     request.model = model_name
+    # The /chat endpoint now uses unified_completion, so we can just call it.
     return await chat(request)
 
 # Convenience endpoints for each model
