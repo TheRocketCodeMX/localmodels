@@ -10,6 +10,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY logging_config.py .
+COPY litellm_config.json .
 
 EXPOSE 8000 4000
 
