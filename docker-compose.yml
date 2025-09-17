@@ -11,13 +11,13 @@ services:
     restart: unless-stopped
     # GPU support commented out for WSL compatibility
     # Uncomment the deploy section below if you have NVIDIA GPU properly configured
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   # API Gateway with ngrok
   gpt-oss-gateway:
