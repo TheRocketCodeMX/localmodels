@@ -260,34 +260,84 @@ async def list_models():
 
 @app.get("/health/models")
 async def health_models():
-    """Check the health status of each configured model in Ollama"""
+    """Check the health status of each configured model in Ollama, including response metrics."""
     model_health_statuses = {}
-    async with httpx.AsyncClient() as client:
-        for model_key, model_info in AVAILABLE_MODELS.items():
-            model_name = model_info["name"]
-            try:
-                # Attempt to get model details from Ollama using /api/show
-                # This endpoint returns details if the model exists, even if not loaded.
-                response = await client.post(f"{ollama_base_url}/api/show", json={"name": model_name}, timeout=10)
+    for model_key, model_info in AVAILABLE_MODELS.items():
+        model_name = model_info["name"]
+        status_entry = {"status": "unknown"}
+        
+        # 1. Check if model exists in Ollama
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"{ollama_base_url}/api/show", json={"name": model_name}, timeout=5)
                 if response.status_code == 200:
-                    # Extract only relevant info for health check
                     details = response.json()
-                    model_health_statuses[model_name] = {
-                        "status": "healthy",
+                    status_entry.update({
                         "ollama_status": "available",
                         "size": details.get("size"),
                         "quantization": details.get("details", {}).get("quantization_level"),
                         "family": details.get("details", {}).get("family"),
                         "description": model_info.get("description")
-                    }
-                elif response.status_code == 404: # Model not found in Ollama
-                    model_health_statuses[model_name] = {"status": "unhealthy", "ollama_status": "not_found", "error": "Model not found in Ollama"}
+                    })
+                elif response.status_code == 404:
+                    status_entry.update({"ollama_status": "not_found", "error": "Model not found in Ollama"})
                 else:
-                    model_health_statuses[model_name] = {"status": "unhealthy", "ollama_status": "api_error", "error": f"Ollama API returned status {response.status_code}"}
-            except httpx.RequestError as e:
-                model_health_statuses[model_name] = {"status": "unhealthy", "ollama_status": "network_error", "error": f"Network or request error: {str(e)}"}
+                    status_entry.update({"ollama_status": "api_error", "error": f"Ollama API returned status {response.status_code}"})
+        except httpx.RequestError as e:
+            status_entry.update({"ollama_status": "network_error", "error": f"Network or request error: {str(e)}"})
+        except Exception as e:
+            status_entry.update({"ollama_status": "unexpected_error", "error": f"Unexpected error during Ollama check: {str(e)}"})
+
+        # 2. Perform a quick LiteLLM completion test for responsiveness and latency
+        test_latency_ms = None
+        test_success = False
+        if status_entry.get("ollama_status") == "available":
+            try:
+                test_messages = [{
+                    "role": "user", 
+                    "content": "Hi"
+                }]
+                test_start_time = time.time()
+                # Use unified_completion for the test, but handle its output carefully
+                test_response = await unified_completion(
+                    model_name_key=model_key,
+                    messages=test_messages,
+                    max_tokens=5, # Keep it very short
+                    temperature=0.1,
+                    stream=False,
+                    reasoning="none",
+                    ollama_base_url=ollama_base_url
+                )
+                test_end_time = time.time()
+                test_latency_ms = (test_end_time - test_start_time) * 1000
+                
+                # Check if the response contains content (indicating success)
+                if hasattr(test_response, 'choices') and test_response.choices[0].message.content:
+                    test_success = True
+                elif isinstance(test_response, dict) and test_response.get("response"): # Direct Ollama fallback
+                    test_success = True
+                
+                status_entry.update({
+                    "litellm_test_status": "responsive",
+                    "litellm_test_latency_ms": round(test_latency_ms, 2),
+                    "litellm_test_success": test_success
+                })
             except Exception as e:
-                model_health_statuses[model_name] = {"status": "unhealthy", "ollama_status": "unexpected_error", "error": f"Unexpected error: {str(e)}"}
+                status_entry.update({
+                    "litellm_test_status": "unresponsive",
+                    "litellm_test_error": str(e),
+                    "litellm_test_latency_ms": test_latency_ms, # May be partial if error occurred early
+                    "litellm_test_success": False
+                })
+        
+        # Determine overall status
+        if status_entry.get("ollama_status") == "available" and status_entry.get("litellm_test_success"):
+            status_entry["status"] = "healthy"
+        else:
+            status_entry["status"] = "unhealthy"
+
+        model_health_statuses[model_key] = status_entry
+
     return JSONResponse(content=model_health_statuses)
 
 
@@ -308,8 +358,12 @@ async def unified_completion(
     litellm_timeout = int(os.getenv("LITELLM_TIMEOUT", 600)) # Default to 600 seconds (10 minutes)
     litellm_retries = int(os.getenv("LITELLM_RETRIES", 3)) # Default to 3 retries
 
+    start_time = time.time() # Start timer
+    success = False
+
     if stream:
         async def generate_stream():
+            nonlocal success # Allow modification of success in outer scope
             try:
                 # Try LiteLLM streaming
                 litellm_response_generator = await acompletion(
@@ -324,6 +378,7 @@ async def unified_completion(
                 )
                 async for chunk in litellm_response_generator:
                     yield chunk # Yield raw LiteLLM chunk object
+                success = True # Mark as success if stream completes without error
             except Exception as litellm_error:
                 print(f"LiteLLM Streaming Error: {litellm_error}")
                 # Fallback to direct Ollama streaming
@@ -349,6 +404,8 @@ async def unified_completion(
                                         try:
                                             data = json.loads(line)
                                             yield data # Yield raw Ollama JSON dict per line
+                                            if data.get("done"): # Check for done flag from Ollama direct
+                                                success = True # Mark as success if direct stream completes
                                         except json.JSONDecodeError:
                                             continue
                             else:
@@ -357,6 +414,10 @@ async def unified_completion(
                 except Exception as fallback_error:
                     print(f"Direct Ollama Streaming Fallback Exception: {fallback_error}")
                     raise HTTPException(status_code=500, detail=f"All streaming methods failed: LiteLLM: {litellm_error}, Direct: {fallback_error}")
+            finally:
+                end_time = time.time() # End timer for streaming
+                latency_ms = (end_time - start_time) * 1000
+                print(f"METRIC: Model={model_name_key}, Type=Streaming, Latency={latency_ms:.2f}ms, Success={success}")
         return generate_stream()
     else:
         try:
@@ -370,6 +431,7 @@ async def unified_completion(
                 timeout=litellm_timeout, # Pass timeout here
                 num_retries=litellm_retries # Pass retries here
             )
+            success = True
             return response # Return LiteLLM response object
         except Exception as litellm_error:
             print(f"LiteLLM Error: {litellm_error}")
@@ -393,11 +455,16 @@ async def unified_completion(
                         json=ollama_request_payload
                     )
                     if direct_response.status_code == 200:
+                        success = True
                         return direct_response.json() # Return direct Ollama JSON response
                     else:
                         raise HTTPException(status_code=500, detail=f"Both LiteLLM and direct Ollama failed. Status: {direct_response.status_code}")
             except Exception as fallback_error:
                 raise HTTPException(status_code=500, detail=f"All methods failed: LiteLLM: {litellm_error}, Direct: {fallback_error}")
+        finally:
+            end_time = time.time() # End timer for non-streaming
+            latency_ms = (end_time - start_time) * 1000
+            print(f"METRIC: Model={model_name_key}, Type=Non-Streaming, Latency={latency_ms:.2f}ms, Success={success}")
 
 
 @app.post("/chat", response_model=ChatResponse)

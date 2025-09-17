@@ -25,7 +25,7 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 ### Fase 4: Monitoreo y Salud
 - [x] Endpoint `/debug/models` para verificar estado de cada modelo
 - [x] Health checks individuales por modelo
-- [ ] Métricas de latencia y success rate
+- [x] Métricas de latencia y success rate
 
 ---
 
