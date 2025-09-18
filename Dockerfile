@@ -12,6 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY logging_config.py .
 COPY litellm_config.json .
+# Include tests and pytest config inside the image for in-container test runs
+COPY pytest.ini .
+COPY tests/ tests/
 
 EXPOSE 8000 4000
 

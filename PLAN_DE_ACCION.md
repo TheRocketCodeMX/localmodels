@@ -35,7 +35,7 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 - [x] Configurar LiteLLM proxy standalone: Separar del FastAPI main
 - [x] Implementar circuit breaker: Para modelos que fallan
 - [x] Añadir logging estructurado: Con observabilidad completa
-- [ ] Tests automatizados: Para cada modelo y endpoint
+- [x] Tests automatizados: Para cada modelo y endpoint
 
 ---
 
@@ -44,6 +44,7 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 - [x] Configurar LiteLLM con timeout y retry policies
 - [x] Investigar incompatibilidad específica con `gpt-oss:20b`
 - [ ] Documentar formato de respuesta esperado vs actual
+- [ ] TAREA PENDIENTE
 
 ---
 
@@ -53,3 +54,29 @@ Este documento consolida las acciones y pasos a seguir, manteniendo la terminolo
 - [x] `app.py:49-54` - Configuración LiteLLM
 - [x] `docker-compose.yml:30-31` - Variables de entorno
 - [x] `.env:5` - Modelo por defecto
+
+
+---
+
+## 🧪 Tests de integración E2E
+
+Cómo ejecutarlos:
+
+1. Levanta los servicios:
+   - docker compose up -d
+   - Espera a que Ollama y el proxy estén listos.
+
+2. Ejecuta los tests desde el host (recomendado):
+   - export GATEWAY_URL=http://localhost:8000
+   - pytest -q tests/integration
+
+3. Ejecuta los tests dentro del contenedor :
+   - docker compose exec gpt-oss-gateway sh -lc "pip install -q pytest && \
+     export GATEWAY_URL=http://localhost:8000 TEST_HTTP_TIMEOUT=240 && \
+     pytest -q tests/integration"
+
+Notas:
+- Los tests detectan dinámicamente los modelos disponibles desde `/` o `/health`.
+- Se prueban `/`, `/health`, `/models`, `/chat` (stream y no stream), `/v1/chat/completions` (stream y no stream) y `/v1/embeddings`.
+- Ajusta TEST_HTTP_TIMEOUT si tu entorno es lento (por ejemplo, export TEST_HTTP_TIMEOUT=240).
+- Si prefieres no instalar pytest cada vez en el contenedor, agrega `pytest` a `requirements.txt` y reconstruye la imagen.
