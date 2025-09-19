@@ -29,7 +29,7 @@ curl http://localhost:8000/
 ```json
 {
   "message": "Multi-Model API with LiteLLM is running",
-  "default_model": "gpt-oss:20b",
+  "default_model": "qwen3:30b",
   "available_models": {
     "gpt-oss:20b": {
       "name": "gpt-oss:20b",
@@ -83,7 +83,7 @@ curl http://localhost:8000/health
 {
   "status": "healthy",
   "ollama_service": "up",
-  "default_model": "gpt-oss:20b",
+  "default_model": "qwen3:30b",
   "available_models": ["gpt-oss:20b", "qwen3:30b", "devstral", "gemma3"],
   "litellm_enabled": true
 }
@@ -629,3 +629,207 @@ for model, result in comparison.items():
 ---
 
 Esta documentación cubre todos los endpoints y formas de uso del sistema LocalModels. Cada endpoint incluye ejemplos prácticos que el equipo de desarrollo puede usar directamente.
+
+---
+---
+
+# Documentación Técnica de la API
+
+Este documento resume los endpoints principales, sus formatos de petición/respuesta y el comportamiento del streaming. Refleja la implementación modularizada actual.
+
+- URL Base: http://localhost:8000
+
+## Endpoints Raíz y de Salud
+- GET /
+  - Devuelve: { message, default_model, available_models, ollama_url, litellm_proxy_enabled, litellm_proxy_url, endpoints }
+
+- GET /health
+  - Devuelve: { status, ollama_service, litellm_proxy_enabled, litellm_proxy_url, litellm_proxy_service, default_model, available_models, litellm_enabled }
+
+- GET /models
+  - Actúa como proxy para el endpoint `/api/tags` de Ollama.
+
+- GET /health/models
+  - Devuelve un informe de salud por cada modelo configurado, incluyendo una prueba rápida con LiteLLM.
+
+## Chat (Nativo del Gateway)
+- POST /chat
+- POST /chat/{model_name}
+- Alias: /chat/qwen3, /chat/devstral, /chat/gemma3, /chat/gpt-oss
+
+Cuerpo de la Petición (application/json):
+{
+  "model": "opcional, sobreescribe el por defecto",
+  "message": "prompt del usuario (string)",
+  "max_tokens": 150,
+  "temperature": 0.7,
+  "stream": false,
+  "reasoning": ""
+}
+
+Respuesta sin streaming (200):
+{
+  "response": "texto del asistente",
+  "model": "clave del modelo usado",
+  "usage": { "prompt_tokens": int, "completion_tokens": int, "total_tokens": int }
+}
+
+Respuesta con streaming:
+- Tipo de medio: text/plain (similar a SSE). Cada fragmento va prefijado con `data: ` y delimitado por una línea en blanco.
+- Los fragmentos contienen piezas parciales de texto. El stream termina con:
+  data: [DONE]
+
+Notas:
+- Internamente, el gateway intenta usar LiteLLM primero; si falla, recurre a una llamada directa a `/api/generate` de Ollama. En este caso de fallback, el conteo de tokens se obtiene de los campos `prompt_eval_count` y `eval_count` de Ollama.
+
+## Chat Compatible con OpenAI
+- POST /v1/chat/completions
+
+Cuerpo de la Petición (application/json):
+{
+  "model": "<clave del modelo>",
+  "messages": [{"role": "system|user|assistant", "content": "..."}],
+  "max_tokens": 150,
+  "temperature": 0.7,
+  "stream": false
+}
+
+Respuesta sin streaming (200):
+{
+  "id": "chatcmpl-*",
+  "object": "chat.completion",
+  "created": 1710000000,
+  "model": "<clave del modelo>",
+  "choices": [
+    { "index": 0, "message": {"role": "assistant", "content": "..."}, "finish_reason": "stop" }
+  ],
+  "usage": { "prompt_tokens": int, "completion_tokens": int, "total_tokens": int }
+}
+
+Respuesta con streaming:
+- Tipo de medio: text/event-stream. Cada fragmento es una línea JSON estilo OpenAI prefijada con `data: `.
+- El fallback a Ollama es **normalizado** a la forma de fragmento (chunk) de OpenAI:
+  {
+    "id": "chatcmpl-ollama-fallback",
+    "object": "chat.completion.chunk",
+    "created": 1710000000,
+    "model": "<clave del modelo>",
+    "choices": [{ "index": 0, "delta": {"content": "..."}, "finish_reason": null|"stop" }]
+  }
+- El stream termina con: `data: [DONE]`
+
+## Embeddings (Compatible con OpenAI)
+- POST /v1/embeddings
+
+Cuerpo de la Petición (application/json):
+{
+  "model": "<clave del modelo>",
+  "input": "string o array de strings"
+}
+
+Respuesta (200):
+{
+  "object": "list",
+  "data": [
+    { "object": "embedding", "embedding": [float, ...], "index": 0 }
+  ],
+  "model": "<clave del modelo>",
+  "usage": { "prompt_tokens": int, "total_tokens": int }
+}
+
+## Errores
+- 4xx por entrada inválida o clave de modelo no disponible.
+- 5xx por errores en los servicios internos. Cuando LiteLLM y el proxy fallan, el gateway intenta un fallback a Ollama directo; si todo falla, devuelve un HTTP 500 con detalles.
+
+## Notas
+- El modelo por defecto puede ser sobreescrito mediante la variable de entorno `DEFAULT_MODEL` o por petición en `/chat`.
+- El logging detallado (verbose) de LiteLLM está activado para ayudar en la depuración (ver logs del servidor).
+
+
+---
+
+## 1.x Endpoints adicionales y ajustes (actualización)
+
+### 1.x.1 Chat Directo a Ollama (sin LiteLLM)
+
+POST `/chat/direct`
+
+- Usa el endpoint nativo de Ollama `/api/generate` como vía directa.
+- Útil para diagnóstico o cuando LiteLLM/proxy no están disponibles.
+
+Cuerpo (application/json):
+```json
+{
+  "message": "texto del usuario",
+  "model": "<clave de modelo>",
+  "max_tokens": 150,
+  "temperature": 0.7,
+  "reasoning": ""
+}
+```
+
+Respuesta (200):
+```json
+{
+  "response": "texto de la IA",
+  "model": "<clave de modelo>",
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
+```
+
+Notas:
+- Ante errores de Ollama, puede responder 500 con `{"detail": "Ollama API error: <code>"}`.
+
+---
+
+### 1.x.2 Debug de modelos (LiteLLM)
+
+POST `/debug/litellm/{model_name}`
+
+- Endpoint de depuración que realiza:
+  - Consulta de metadatos del modelo (`/api/show`) y procesos (`/api/ps`).
+  - Una llamada de prueba con LiteLLM para medir latencia.
+  - Devuelve un resumen con posible advertencia y detalles de hardware cuando están disponibles.
+
+Cuerpo (application/json):
+```json
+{
+  "message": "texto de prueba",
+  "max_tokens": 64,
+  "temperature": 0.7,
+  "reasoning": ""
+}
+```
+
+Respuestas típicas:
+- 200 OK (éxito):
+```json
+{
+  "status": "ok",
+  "debug_format_version": "6.0",
+  "latency_ms": 1234.56,
+  "hardware_info": { "gpu_model": "...", "gpu_devices": [ ... ], "size_vram_bytes": 0, ...},
+  "full_response_payload": { "choices": [ ... ], "usage": { ... } }
+}
+```
+- 404 si `model_name` no existe:
+```json
+{ "status": "error", "error_details": { "error_message": "Model '<name>' not found." } }
+```
+- 500 en fallo de la prueba LiteLLM (incluye `error_details` y `debug_info`).
+
+---
+
+### 1.x.3 Campos adicionales en `/` y `/health`
+
+- GET `/` incluye además:
+  - `litellm_proxy_enabled`: booleano
+  - `litellm_proxy_url`: string
+
+- GET `/health` incluye además:
+  - `litellm_proxy_enabled`: booleano
+  - `litellm_proxy_url`: string
+  - `litellm_proxy_service`: "up" | "down" | "n/a"
+
+Notas:
+- El `default_model` actual por defecto es `qwen3:30b` (configurable vía variable de entorno `DEFAULT_MODEL`).
